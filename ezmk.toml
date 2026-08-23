@@ -1,0 +1,33 @@
+[project]
+name = "vt100_utils"
+type = "static"
+version = "0.1.0"
+language = "C++11"
+
+[compile]
+flags = ["-Wall", "-Wextra"]
+default_profile = "debug"
+include_dirs = ["include"]
+
+[compile.profile.debug]
+flags = ["-g", "-O0"]
+msvc_flags = ["/Zi", "/Od"]
+
+[compile.profile.release]
+flags = ["-O2", "-DNDEBUG"]
+msvc_flags = ["/O2", "/DNDEBUG"]
+
+[link]
+flags = []
+link_dirs = []
+system_target = []
+
+[depends]
+lib = []
+
+[test]                      # 启用项目测试：取消注释后运行 `ezmk test`
+framework = "ezmk"          # "catch2" | "ezmk"（内置框架）
+dirs = ["test"]
+default_profile = "debug"   # 1.2.0-dev.12+：测试默认 profile
+# include_dirs = ["test/helpers"]   # 测试专属 -I（1.2.0-dev.12+）
+# link_targets = ["pthread"]        # 测试专属 -l（1.2.0-dev.12+）
