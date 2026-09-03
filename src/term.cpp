@@ -4,12 +4,119 @@
 
 #include <cctype>
 #include <cstring>
+
+#ifdef _WIN32
+
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+
+#else
+
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
 
+#endif
+
 namespace vt100_utils {
+
+#ifdef _WIN32
+namespace {
+
+// 探测并启用 stdout 控制台的 VT 处理；启用成功后保持开启（VT 为 Windows
+// 控制台渲染 ANSI 序列的前提）。stdout 被重定向或非控制台时返回 false。
+bool enable_vt_processing() noexcept {
+	HANDLE h = ::GetStdHandle(STD_OUTPUT_HANDLE);
+	if (h == nullptr || h == INVALID_HANDLE_VALUE)
+		return false;
+
+	DWORD mode = 0;
+	if (!::GetConsoleMode(h, &mode))
+		return false;
+
+	mode |= ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT |
+	        ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+	return ::SetConsoleMode(h, mode) != 0;
+}
+
+} // namespace
+
+namespace detail {
+
+bool parse_da1_response(const std::string &resp) noexcept {
+	const char esc[] = "\x1b[?";
+	std::size_t pos = resp.find(esc);
+	if (pos == std::string::npos)
+		return false;
+
+	std::size_t i = pos + (sizeof(esc) - 1);
+	if (i >= resp.size() || !std::isdigit(static_cast<unsigned char>(resp[i])))
+		return false;
+
+	while (i < resp.size() &&
+	       (std::isdigit(static_cast<unsigned char>(resp[i])) || resp[i] == ';'))
+		++i;
+
+	return i < resp.size() && resp[i] == 'c';
+}
+
+bool parse_xtgettcap_rgb(const std::string &resp) noexcept {
+	std::size_t pos = resp.find("6803=");
+	if (pos == std::string::npos)
+		return false;
+	return resp.find("RGB", pos) != std::string::npos;
+}
+
+// Windows 控制台不通过转义查询应答来暴露能力，此实现仅在 POSIX 下生效。
+std::string query_terminal(const char *cmd, int timeout_ms) noexcept {
+	(void)cmd;
+	(void)timeout_ms;
+	return std::string();
+}
+
+} // namespace detail
+
+bool supports_vt100() noexcept {
+	return enable_vt_processing();
+}
+
+bool supports_truecolor() noexcept {
+	// Windows 控制台一旦支持 VT 处理即支持 24 位真彩色（Windows Terminal /
+	// 现代 conhost），故与 supports_vt100 结论一致。
+	return enable_vt_processing();
+}
+
+bool enable_vt100() noexcept {
+	return enable_vt_processing();
+}
+
+std::pair<std::size_t, std::size_t> term_size() noexcept {
+	const DWORD handles[] = {STD_OUTPUT_HANDLE, STD_INPUT_HANDLE, STD_ERROR_HANDLE};
+	for (std::size_t i = 0; i < sizeof(handles) / sizeof(handles[0]); ++i) {
+		HANDLE h = ::GetStdHandle(handles[i]);
+		if (h == nullptr || h == INVALID_HANDLE_VALUE)
+			continue;
+
+		CONSOLE_SCREEN_BUFFER_INFO csbi;
+		if (!::GetConsoleScreenBufferInfo(h, &csbi))
+			continue;
+
+		int rows = static_cast<int>(csbi.srWindow.Bottom - csbi.srWindow.Top) + 1;
+		int cols = static_cast<int>(csbi.srWindow.Right - csbi.srWindow.Left) + 1;
+		if (rows > 0 && cols > 0)
+			return std::make_pair(static_cast<std::size_t>(rows),
+			                      static_cast<std::size_t>(cols));
+	}
+	return std::make_pair(static_cast<std::size_t>(0), static_cast<std::size_t>(0));
+}
+
+#else // !_WIN32
 
 namespace {
 
@@ -117,5 +224,7 @@ std::pair<std::size_t, std::size_t> term_size() noexcept {
 	}
 	return std::make_pair(static_cast<std::size_t>(0), static_cast<std::size_t>(0));
 }
+
+#endif // _WIN32
 
 } // namespace vt100_utils

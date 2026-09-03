@@ -2,7 +2,7 @@
 
 A small C++11 static library for generating VT100/ANSI terminal escape sequences
 and probing terminal capabilities, with no dependencies beyond the C/C++ standard
-library and POSIX.
+library, POSIX (on Unix) and the Win32 console API (on Windows NT).
 
 ## Features
 
@@ -13,10 +13,14 @@ library and POSIX.
 - Color helpers: grayscale, HSL→RGB conversion, and alpha blending.
 - Actively probe terminal capabilities by sending escape queries and reading the
   responses — no environment variables involved:
-  - `supports_vt100()` — sends a **DA1** query (`ESC[c`) and parses the reply.
-  - `supports_truecolor()` — sends an **XTGETTCAP** query (`ESC P + q 6803 ESC \`,
-    where `6803` is the decimal encoding of `"RGB"`) and checks for an `RGB` reply.
-- Query terminal size via `ioctl(TIOCGWINSZ)`.
+  - `supports_vt100()` — on POSIX sends a **DA1** query (`ESC[c`) and parses the
+    reply; on Windows enables console VT processing (`ENABLE_VIRTUAL_TERMINAL_PROCESSING`).
+  - `supports_truecolor()` — on POSIX sends an **XTGETTCAP** query
+    (`ESC P + q 6803 ESC \`, where `6803` is the decimal encoding of `"RGB"`) and
+    checks for an `RGB` reply; on Windows a console that supports VT also supports
+    24-bit color, so it agrees with `supports_vt100()`.
+- Query terminal size via `ioctl(TIOCGWINSZ)` on POSIX and
+  `GetConsoleScreenBufferInfo` on Windows.
 
 ## Build
 
@@ -29,9 +33,13 @@ ezmk test         # build and run unit tests
 
 Output: `build/libvt100_utils.a`.
 
-> Probing only works on an interactive terminal (both stdin and stdout must be a
-> TTY). In non-interactive environments `supports_vt100()` and
+> POSIX probing only works on an interactive terminal (both stdin and stdout must
+> be a TTY). In non-interactive environments `supports_vt100()` and
 > `supports_truecolor()` return `false`, which is expected.
+>
+> On Windows, ANSI sequences render only when VT processing is enabled, so the
+> capability check enables it and leaves it on (requires a modern console, e.g.
+> Windows Terminal or recent conhost). `enable_vt100()` performs the same enabling.
 
 ## Usage
 
@@ -125,7 +133,8 @@ std::string gen_rgb_seq(const std::optional<RgbColor>& fg = std::nullopt,
 ```cpp
 bool supports_truecolor() noexcept;            // active probe, no env vars
 bool supports_vt100() noexcept;                // active probe, no env vars
-bool enable_vt100() noexcept;                  // no-op on POSIX, returns true
+bool enable_vt100() noexcept;                  // no-op returning true on POSIX;
+                                               // enables VT processing on Windows
 std::pair<std::size_t, std::size_t> term_size() noexcept;   // {rows, cols}, {0,0} on failure
 ```
 
