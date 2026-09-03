@@ -7,6 +7,11 @@
 #include <vector>
 #include <string>
 
+#if (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || \
+    (!defined(_MSVC_LANG) && __cplusplus >= 201703L)
+#include <optional>
+#endif
+
 namespace vt100_utils {
 	std::string gen_std_seq(FormatCode fc) noexcept;
 	std::string gen_std_seq(const std::initializer_list<FormatCode> &fcs) noexcept;
@@ -14,7 +19,6 @@ namespace vt100_utils {
 
 	std::string gen_rgb_seq(const RgbColor color, bool fg = true) noexcept;
 #ifdef __cpp_lib_optional
-#include <optional>
 	inline std::string gen_rgb_seq(
 		const std::optional<RgbColor> &fg = std::nullopt,
 		const std::optional<RgbColor> &bg = std::nullopt
