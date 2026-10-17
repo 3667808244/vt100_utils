@@ -4,3 +4,4 @@
 #include "vt100_utils/gen.h"
 #include "vt100_utils/rgb_color.h"
 #include "vt100_utils/term.h"
+#include "vt100_utils/version.h"

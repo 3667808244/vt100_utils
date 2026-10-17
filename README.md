@@ -7,7 +7,7 @@ library, POSIX (on Unix) and the Win32 console API (on Windows NT).
 ## Features
 
 - Generate SGR (Select Graphic Rendition) escape sequences from `FormatCode`
-  enums (single, initializer-list, or vector).
+  enums (single, initializer-list, or vector). An empty list produces a reset.
 - Generate 24-bit truecolor (`\x1b[38;2;r;g;bm`) and 256-color
   (`\x1b[38;5;Nm`) sequences.
 - Color helpers: grayscale, HSL→RGB conversion, and alpha blending.
@@ -16,9 +16,10 @@ library, POSIX (on Unix) and the Win32 console API (on Windows NT).
   - `supports_vt100()` — on POSIX sends a **DA1** query (`ESC[c`) and parses the
     reply; on Windows enables console VT processing (`ENABLE_VIRTUAL_TERMINAL_PROCESSING`).
   - `supports_truecolor()` — on POSIX sends an **XTGETTCAP** query
-    (`ESC P + q 6803 ESC \`, where `6803` is the decimal encoding of `"RGB"`) and
-    checks for an `RGB` reply; on Windows a console that supports VT also supports
-    24-bit color, so it agrees with `supports_vt100()`.
+    (`ESC P + q 6803 ESC \`, where `6803` is the hex encoding of `"RGB"`) and
+    accepts both the standard hex-encoded reply (`524742`) and the literal
+    `RGB`; on Windows a console that supports VT is assumed to support 24-bit
+    color, so it agrees with `supports_vt100()`.
 - Query terminal size via `ioctl(TIOCGWINSZ)` on POSIX and
   `GetConsoleScreenBufferInfo` on Windows.
 
@@ -37,9 +38,13 @@ Output: `build/libvt100_utils.a`.
 > be a TTY). In non-interactive environments `supports_vt100()` and
 > `supports_truecolor()` return `false`, which is expected.
 >
+> The POSIX probes temporarily put stdin into raw mode and discard pending input,
+> so do not call them while the application relies on already-buffered input.
+>
 > On Windows, ANSI sequences render only when VT processing is enabled, so the
 > capability check enables it and leaves it on (requires a modern console, e.g.
-> Windows Terminal or recent conhost). `enable_vt100()` performs the same enabling.
+> Windows Terminal or recent conhost). Existing console mode flags are preserved.
+> `enable_vt100()` performs the same enabling and reports whether it succeeded.
 
 ## Usage
 
@@ -58,6 +63,9 @@ std::cout << gen_std_seq({FormatCode::Bold, FormatCode::FgRed})
 // Truecolor
 std::cout << gen_rgb_seq(RgbColor{255, 0, 0}) << "red" << gen_std_seq(FormatCode::Reset);
 
+// Background color (no magic bools)
+std::cout << gen_rgb_seq(RgbColor{0, 0, 255}, ColorLayer::Background) << "blue bg";
+
 // 256-color
 std::cout << gen_256_seq(196) << "red" << gen_std_seq(FormatCode::Reset);
 
@@ -70,33 +78,46 @@ RgbColor blended = overlay(c, gray(0), 0.5f);        // 50% blend with black
 if (supports_truecolor()) { /* ... */ }
 
 // Terminal size {rows, cols}
-auto [rows, cols] = term_size();
+auto size = term_size();
+std::size_t rows = size.first;
+std::size_t cols = size.second;
 ```
 
-With C++17, the optional overload is available:
+With C++17, the optional foreground/background pair helper is available:
 
 ```cpp
 #include <optional>
 
 // fg/bg both nullopt -> returns "\x1b[0m" (reset)
-std::cout << gen_rgb_seq(std::nullopt, std::nullopt);
+std::cout << gen_rgb_pair_seq(std::nullopt, std::nullopt);
 
 // fg only
-std::cout << gen_rgb_seq(std::optional<RgbColor>{RgbColor{255, 0, 0}});
+std::cout << gen_rgb_pair_seq(RgbColor{255, 0, 0});
 
 // both fg and bg
-std::cout << gen_rgb_seq(
-    std::optional<RgbColor>{RgbColor{255, 0, 0}},
-    std::optional<RgbColor>{RgbColor{0, 0, 255}});
+std::cout << gen_rgb_pair_seq(RgbColor{255, 0, 0}, RgbColor{0, 0, 255});
 ```
 
 ## API Reference
+
+### `version.h`
+
+```cpp
+#define VT100_UTILS_VERSION_MAJOR 0
+#define VT100_UTILS_VERSION_MINOR 2
+#define VT100_UTILS_VERSION_PATCH 1
+#define VT100_UTILS_VERSION_STRING "0.2.1"
+```
 
 ### `format_code.h`
 
 ```cpp
 enum class FormatCode : uint8_t {
-    Reset = 0, Bold = 1, Dim = 2, Underline = 4, Blink = 5, Reverse = 7,
+    Reset = 0, Bold = 1, Dim = 2, Italic = 3, Underline = 4,
+    Blink = 5, Reverse = 7, Strikethrough = 9,
+    BoldOff = 22, DimOff = 22, ItalicOff = 23, UnderlineOff = 24,
+    BlinkOff = 25, ReverseOff = 27, StrikethroughOff = 29,
+    FgDefault = 39, BgDefault = 49,
     FgBlack = 30, ... FgWhite = 37,
     BgBlack = 40, ... BgWhite = 47,
     FgBrightBlack = 90, ... FgBrightWhite = 97,
@@ -108,33 +129,42 @@ enum class FormatCode : uint8_t {
 
 ```cpp
 struct RgbColor { uint8_t r, g, b; };
+constexpr bool operator==(RgbColor, RgbColor) noexcept;
+constexpr bool operator!=(RgbColor, RgbColor) noexcept;
 
-RgbColor gray(uint8_t g) noexcept;                        // {g,g,g}
-RgbColor hsl(float h, float s, float l) noexcept;         // h in degrees, s/l in [0,1]
+constexpr RgbColor gray(uint8_t g) noexcept;              // {g,g,g}
+RgbColor hsl(float h, float s, float l) noexcept;         // h in degrees,
+                                                          // s/l clamped to [0,1]
 RgbColor overlay(RgbColor raw, RgbColor mask, float alpha = 0.5f) noexcept;
+                                                          // alpha clamped to [0,1]
 ```
 
 ### `gen.h`
 
 ```cpp
-std::string gen_std_seq(FormatCode fc) noexcept;                              // "\x1b[{code}m"
-std::string gen_std_seq(const std::initializer_list<FormatCode>& fcs) noexcept;
-std::string gen_std_seq(const std::vector<FormatCode>& fcs) noexcept;         // "\x1b[1;31m"
-std::string gen_rgb_seq(RgbColor color, bool fg = true) noexcept;             // "\x1b[38;2;r;g;bm"
-std::string gen_256_seq(uint8_t color, bool fg = true) noexcept;              // "\x1b[38;5;Nm"
+enum class ColorLayer : uint8_t { Foreground, Background };
 
-// C++17 only (guarded by __cpp_lib_optional):
-std::string gen_rgb_seq(const std::optional<RgbColor>& fg = std::nullopt,
-                        const std::optional<RgbColor>& bg = std::nullopt) noexcept;
+std::string gen_std_seq(FormatCode fc);                              // "\x1b[{code}m"
+std::string gen_std_seq(const std::initializer_list<FormatCode>& fcs);
+std::string gen_std_seq(const std::vector<FormatCode>& fcs);         // "\x1b[1;31m";
+                                                                     // empty -> "\x1b[0m"
+std::string gen_rgb_seq(RgbColor color, bool fg = true);             // "\x1b[38;2;r;g;bm"
+std::string gen_rgb_seq(RgbColor color, ColorLayer layer);
+std::string gen_256_seq(uint8_t color, bool fg = true);              // "\x1b[38;5;Nm"
+std::string gen_256_seq(uint8_t color, ColorLayer layer);
+
+// C++17 only (the overload is compiled when the language mode is >= C++17):
+std::string gen_rgb_pair_seq(const std::optional<RgbColor>& fg = std::nullopt,
+                             const std::optional<RgbColor>& bg = std::nullopt);
 ```
 
 ### `term.h`
 
 ```cpp
-bool supports_truecolor() noexcept;            // active probe, no env vars
-bool supports_vt100() noexcept;                // active probe, no env vars
-bool enable_vt100() noexcept;                  // no-op returning true on POSIX;
-                                               // enables VT processing on Windows
+bool supports_truecolor();       // active probe, may consume pending stdin
+bool supports_vt100();           // active probe, may consume pending stdin
+bool enable_vt100() noexcept;    // POSIX: no-op, returns whether stdout is a TTY;
+                                 // Windows: enables VT processing and reports success
 std::pair<std::size_t, std::size_t> term_size() noexcept;   // {rows, cols}, {0,0} on failure
 ```
 
@@ -145,5 +175,6 @@ ezmk test
 ```
 
 The built-in test framework compiles `test/test_vt100_utils.cpp` as a standalone
-executable covering exact escape strings, color math, DA1/XTGETTCAP response
-parsing, and `term_size` invariants.
+executable covering exact escape strings, color math (including out-of-range
+input), DA1/XTGETTCAP response parsing (including the standard hex-encoded
+reply), and `term_size` invariants.

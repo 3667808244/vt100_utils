@@ -1,14 +1,18 @@
 #include "vt100_utils/term.h"
 
-#include "probe.h"
+#include "vt100_utils/detail/probe.h"
 
 #include <cctype>
 #include <cstring>
 
 #ifdef _WIN32
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -17,6 +21,8 @@
 
 #else
 
+#include <cerrno>
+#include <chrono>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -25,29 +31,9 @@
 #endif
 
 namespace vt100_utils {
-
-#ifdef _WIN32
-namespace {
-
-// 探测并启用 stdout 控制台的 VT 处理；启用成功后保持开启（VT 为 Windows
-// 控制台渲染 ANSI 序列的前提）。stdout 被重定向或非控制台时返回 false。
-bool enable_vt_processing() noexcept {
-	HANDLE h = ::GetStdHandle(STD_OUTPUT_HANDLE);
-	if (h == nullptr || h == INVALID_HANDLE_VALUE)
-		return false;
-
-	DWORD mode = 0;
-	if (!::GetConsoleMode(h, &mode))
-		return false;
-
-	mode |= ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT |
-	        ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-	return ::SetConsoleMode(h, mode) != 0;
-}
-
-} // namespace
-
 namespace detail {
+
+// Platform-independent reply parsers.
 
 bool parse_da1_response(const std::string &resp) noexcept {
 	const char esc[] = "\x1b[?";
@@ -59,22 +45,57 @@ bool parse_da1_response(const std::string &resp) noexcept {
 	if (i >= resp.size() || !std::isdigit(static_cast<unsigned char>(resp[i])))
 		return false;
 
-	while (i < resp.size() &&
-	       (std::isdigit(static_cast<unsigned char>(resp[i])) || resp[i] == ';'))
+	while (i < resp.size() && (std::isdigit(static_cast<unsigned char>(resp[i])) || resp[i] == ';'))
 		++i;
 
 	return i < resp.size() && resp[i] == 'c';
 }
 
 bool parse_xtgettcap_rgb(const std::string &resp) noexcept {
-	std::size_t pos = resp.find("6803=");
+	const char name[] = "6803=";
+	std::size_t pos = resp.find(name);
 	if (pos == std::string::npos)
 		return false;
-	return resp.find("RGB", pos) != std::string::npos;
+
+	// Only inspect the value of this reply: from '=' up to the ST terminator.
+	const std::size_t begin = pos + (sizeof(name) - 1);
+	std::size_t end = resp.find("\x1b\\", begin);
+	if (end == std::string::npos)
+		end = resp.size();
+
+	// Standard XTGETTCAP replies hex-encode the value ("RGB" -> "524742");
+	// some terminals send the literal name instead.
+	return resp.find("524742", begin) < end || resp.find("RGB", begin) < end;
 }
 
-// Windows 控制台不通过转义查询应答来暴露能力，此实现仅在 POSIX 下生效。
-std::string query_terminal(const char *cmd, int timeout_ms) noexcept {
+} // namespace detail
+
+#ifdef _WIN32
+
+namespace {
+
+// Enables VT processing on stdout and leaves it enabled (required for the
+// console to render ANSI sequences). Existing mode flags are preserved;
+// only the two flags VT output needs are added.
+bool enable_vt_processing() noexcept {
+	HANDLE h = ::GetStdHandle(STD_OUTPUT_HANDLE);
+	if (h == nullptr || h == INVALID_HANDLE_VALUE)
+		return false;
+
+	DWORD mode = 0;
+	if (!::GetConsoleMode(h, &mode))
+		return false;
+
+	mode |= ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+	return ::SetConsoleMode(h, mode) != 0;
+}
+
+} // namespace
+
+namespace detail {
+
+// Windows consoles do not expose capabilities through escape-query replies.
+std::string query_terminal(const char *cmd, int timeout_ms) {
 	(void)cmd;
 	(void)timeout_ms;
 	return std::string();
@@ -82,13 +103,13 @@ std::string query_terminal(const char *cmd, int timeout_ms) noexcept {
 
 } // namespace detail
 
-bool supports_vt100() noexcept {
+bool supports_vt100() {
 	return enable_vt_processing();
 }
 
-bool supports_truecolor() noexcept {
-	// Windows 控制台一旦支持 VT 处理即支持 24 位真彩色（Windows Terminal /
-	// 现代 conhost），故与 supports_vt100 结论一致。
+bool supports_truecolor() {
+	// Heuristic: a console that accepts VT processing is assumed to render
+	// 24-bit color as well (Windows Terminal and current conhost do).
 	return enable_vt_processing();
 }
 
@@ -107,11 +128,10 @@ std::pair<std::size_t, std::size_t> term_size() noexcept {
 		if (!::GetConsoleScreenBufferInfo(h, &csbi))
 			continue;
 
-		int rows = static_cast<int>(csbi.srWindow.Bottom - csbi.srWindow.Top) + 1;
-		int cols = static_cast<int>(csbi.srWindow.Right - csbi.srWindow.Left) + 1;
+		const int rows = static_cast<int>(csbi.srWindow.Bottom - csbi.srWindow.Top) + 1;
+		const int cols = static_cast<int>(csbi.srWindow.Right - csbi.srWindow.Left) + 1;
 		if (rows > 0 && cols > 0)
-			return std::make_pair(static_cast<std::size_t>(rows),
-			                      static_cast<std::size_t>(cols));
+			return std::make_pair(static_cast<std::size_t>(rows), static_cast<std::size_t>(cols));
 	}
 	return std::make_pair(static_cast<std::size_t>(0), static_cast<std::size_t>(0));
 }
@@ -134,65 +154,79 @@ struct TermiosGuard {
 
 namespace detail {
 
-bool parse_da1_response(const std::string &resp) noexcept {
-	const char esc[] = "\x1b[?";
-	std::size_t pos = resp.find(esc);
-	if (pos == std::string::npos)
-		return false;
-
-	std::size_t i = pos + (sizeof(esc) - 1);
-	if (i >= resp.size() || !std::isdigit(static_cast<unsigned char>(resp[i])))
-		return false;
-
-	while (i < resp.size() &&
-	       (std::isdigit(static_cast<unsigned char>(resp[i])) || resp[i] == ';'))
-		++i;
-
-	return i < resp.size() && resp[i] == 'c';
-}
-
-bool parse_xtgettcap_rgb(const std::string &resp) noexcept {
-	std::size_t pos = resp.find("6803=");
-	if (pos == std::string::npos)
-		return false;
-	return resp.find("RGB", pos) != std::string::npos;
-}
-
-std::string query_terminal(const char *cmd, int timeout_ms) noexcept {
+std::string query_terminal(const char *cmd, int timeout_ms) {
+	if (cmd == nullptr || timeout_ms < 0)
+		return std::string();
 	if (!::isatty(STDIN_FILENO) || !::isatty(STDOUT_FILENO))
 		return std::string();
 
 	TermiosGuard guard;
 	if (::tcgetattr(STDIN_FILENO, &guard.saved) != 0)
 		return std::string();
-	guard.active = true;
 
 	struct termios raw = guard.saved;
 	raw.c_lflag &= ~(ICANON | ECHO);
+	raw.c_iflag &= ~(ICRNL | IXON);
 	raw.c_cc[VMIN] = 0;
 	raw.c_cc[VTIME] = 0;
-	if (::tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0)
+	// TCSAFLUSH also drops pending input so stale bytes are not read as a reply.
+	if (::tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0)
 		return std::string();
+	guard.active = true;
 
-	::tcflush(STDIN_FILENO, TCIFLUSH);
+	const std::size_t len = std::strlen(cmd);
+	std::size_t written = 0;
+	while (written < len) {
+		const ssize_t n = ::write(STDOUT_FILENO, cmd + written, len - written);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return std::string();
+		}
+		if (n == 0)
+			return std::string();
+		written += static_cast<std::size_t>(n);
+	}
 
-	std::size_t len = std::strlen(cmd);
-	if (::write(STDOUT_FILENO, cmd, len) != static_cast<ssize_t>(len))
-		return std::string();
-	::tcdrain(STDOUT_FILENO);
+	typedef std::chrono::steady_clock clock_type;
+	const clock_type::time_point deadline =
+	    clock_type::now() + std::chrono::milliseconds(timeout_ms);
 
 	std::string resp;
+	resp.reserve(64);
 	char buf[256];
 	while (true) {
+		const clock_type::duration left = deadline - clock_type::now();
+		if (left <= clock_type::duration::zero())
+			break;
+
+		long wait_ms =
+		    static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(left).count());
+		if (wait_ms <= 0)
+			wait_ms = 1;
+
 		struct pollfd pfd;
 		pfd.fd = STDIN_FILENO;
 		pfd.events = POLLIN;
-		int r = ::poll(&pfd, 1, timeout_ms);
-		if (r <= 0 || !(pfd.revents & POLLIN))
+		pfd.revents = 0;
+		const int r = ::poll(&pfd, 1, static_cast<int>(wait_ms));
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (r == 0)
+			break;
+		if (!(pfd.revents & POLLIN))
 			break;
 
-		ssize_t n = ::read(STDIN_FILENO, buf, sizeof(buf));
-		if (n <= 0)
+		const ssize_t n = ::read(STDIN_FILENO, buf, sizeof(buf));
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (n == 0)
 			break;
 		resp.append(buf, static_cast<std::size_t>(n));
 	}
@@ -201,22 +235,23 @@ std::string query_terminal(const char *cmd, int timeout_ms) noexcept {
 
 } // namespace detail
 
-bool supports_vt100() noexcept {
+bool supports_vt100() {
 	return detail::parse_da1_response(detail::query_terminal("\x1b[c", 150));
 }
 
-bool supports_truecolor() noexcept {
+bool supports_truecolor() {
 	return detail::parse_xtgettcap_rgb(detail::query_terminal("\x1bP+q6803\x1b\\", 150));
 }
 
 bool enable_vt100() noexcept {
-	return true;
+	// POSIX terminals need no enabling; report whether stdout is a terminal.
+	return ::isatty(STDOUT_FILENO) != 0;
 }
 
 std::pair<std::size_t, std::size_t> term_size() noexcept {
 	const int fds[] = {STDOUT_FILENO, STDIN_FILENO, STDERR_FILENO};
 	for (std::size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); ++i) {
-		int fd = fds[i];
+		const int fd = fds[i];
 		struct winsize ws;
 		if (::isatty(fd) && ::ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0)
 			return std::make_pair(static_cast<std::size_t>(ws.ws_row),
